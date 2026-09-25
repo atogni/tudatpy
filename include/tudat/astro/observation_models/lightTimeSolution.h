@@ -1179,6 +1179,12 @@ public:
         return correctionsNeedFrequency_;
     }
 
+    //! Signal time at the first link end (incl. delays) of the last multi-leg solution referenced to the receiver
+    TimeType getFirstLinkEndTime( )
+    {
+        return firstLinkEndTime_;
+    }
+
 private:
     void initializeFullLinkLightTimeCalculator( )
     {
@@ -1229,6 +1235,7 @@ private:
             // Add computed light-time to total time and move to next leg
             totalLightTime += currentLightTime;
         }
+        firstLinkEndTime_ = currentLinkEndReceptionTime;
 
         // Define 'current transmission time': time at the transmitting antenna
         TimeType currentLinkEndTransmissionTime = time + linkEndsDelays_.at( startLinkEndIndex_ );
@@ -1259,6 +1266,8 @@ private:
     }
 
     std::vector< std::shared_ptr< LightTimeCalculator< ObservationScalarType, TimeType > > > lightTimeCalculators_;
+
+    TimeType firstLinkEndTime_ = TUDAT_NAN;
 
     std::shared_ptr< LightTimeConvergenceCriteria > lightTimeConvergenceCriteria_;
 

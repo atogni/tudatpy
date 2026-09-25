@@ -271,11 +271,8 @@ public:
                                                  currentTurnAroundRatio );
         }
 
-        TimeType startLightTime =
-                arcStartObservationModel_->computeIdealObservationsWithLinkEndData(
-                        receptionTdbStartTime, linkEndAssociatedWithTime, arcStartLinkEndTimes, arcStartLinkEndStates, ancillarySettings )(
-                        0, 0 ) /
-                physical_constants::getSpeedOfLight< ObservationScalarType >( );
+        arcStartObservationModel_->computeIdealObservationsWithLinkEndData(
+                receptionTdbStartTime, linkEndAssociatedWithTime, arcStartLinkEndTimes, arcStartLinkEndStates, ancillarySettings );
 
         // Set frequencies for ionosphere/corona
         if( arcEndObservationModel_->getFullLinkLightTimeCalculator( )->doCorrectionsNeedFrequency( ) )
@@ -288,15 +285,12 @@ public:
                                                  ancillarySettings,
                                                  currentTurnAroundRatio );
         }
-        TimeType endLightTime =
-                arcEndObservationModel_->computeIdealObservationsWithLinkEndData(
-                        receptionTdbEndTime, linkEndAssociatedWithTime, arcEndLinkEndTimes, arcEndLinkEndStates, ancillarySettings )( 0,
-                                                                                                                                      0 ) /
-                physical_constants::getSpeedOfLight< ObservationScalarType >( );
+        arcEndObservationModel_->computeIdealObservationsWithLinkEndData(
+                receptionTdbEndTime, linkEndAssociatedWithTime, arcEndLinkEndTimes, arcEndLinkEndStates, ancillarySettings );
 
         // Moyer (2000), eqs. 13-52 and 13-53
-        TimeType transmissionTdbStartTime = receptionTdbStartTime - startLightTime;
-        TimeType transmissionTdbEndTime = receptionTdbEndTime - endLightTime;
+        TimeType transmissionTdbStartTime = arcStartObservationModel_->getFullLinkLightTimeCalculator( )->getFirstLinkEndTime( );
+        TimeType transmissionTdbEndTime = arcEndObservationModel_->getFullLinkLightTimeCalculator( )->getFirstLinkEndTime( );
 
         TimeType transmissionUtcStartTime = timeScaleConverter_->template getCurrentTime< TimeType >(
                 basic_astrodynamics::tdb_scale, basic_astrodynamics::utc_scale, transmissionTdbStartTime, nominalTransmittingStationState );
