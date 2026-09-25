@@ -114,7 +114,11 @@ public:
      */
     virtual Eigen::Vector6d getCartesianStateFromExtendedTime( const Time& currentTime )
     {
-        return getCartesianState( currentTime.getSeconds< double >( ) );
+        const double doubleTime = currentTime.getSeconds< double >( );
+        Eigen::Vector6d state = getCartesianState( doubleTime );
+        // Move the position from the double-rounded epoch to the full-precision one
+        state.segment( 0, 3 ) += state.segment( 3, 3 ) * ( currentTime - Time( doubleTime ) ).getSeconds< double >( );
+        return state;
     }
 
     //! Get state from ephemeris (with long double as state scalar and Time as time type).
