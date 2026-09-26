@@ -2404,6 +2404,54 @@ public:
                         observationBias,
                         stationStates,
                         dsnNWayAveragedDopplerObservationSettings->getSubtractDopplerSignature( ) );
+
+                // Functions used to compute the change of the signal path over the count from the displacement of each link
+                // end (body velocity + change of the position w.r.t. the body), instead of differencing two light times
+                std::vector< std::function< Eigen::Vector6d( const double ) > > linkEndBodyStateFunctions;
+                std::vector< std::function< Eigen::Vector3d( const double ) > > linkEndReferencePointOffsetFunctions;
+                for( unsigned int i = 0; i < linkEnds.size( ); i++ )
+                {
+                    LinkEndId currentLinkEnd = linkEnds.at( getNWayLinkEnumFromIndex( i, linkEnds.size( ) ) );
+                    std::shared_ptr< simulation_setup::Body > linkEndBody = bodies.at( currentLinkEnd.bodyName_ );
+                    linkEndBodyStateFunctions.push_back(
+                            [ = ]( const double time ) { return linkEndBody->getStateInBaseFrameFromEphemeris< double, double >( time ); } );
+
+                    std::function< Eigen::Vector6d( const double ) > bodyFixedReferencePointStateFunction;
+                    if( currentLinkEnd.stationName_ != "" )
+                    {
+                        const std::string referencePointName = currentLinkEnd.stationName_;
+                        const std::string frameOrigin = bodies.getFrameOrigin( );
+                        if( simulation_setup::isReferencePointGroundStation( linkEndBody, referencePointName ) )
+                        {
+                            std::shared_ptr< ground_stations::GroundStation > groundStation = linkEndBody->getGroundStation( referencePointName );
+                            bodyFixedReferencePointStateFunction = [ = ]( const double time ) {
+                                return groundStation->getStateInPlanetFixedFrame< double, double >( time, frameOrigin );
+                            };
+                        }
+                        else if( linkEndBody->getVehicleSystems( ) != nullptr )
+                        {
+                            std::shared_ptr< system_models::VehicleSystems > vehicleSystems = linkEndBody->getVehicleSystems( );
+                            bodyFixedReferencePointStateFunction = [ = ]( const double time ) {
+                                return vehicleSystems->getReferencePointStateInBodyFixedFrame< double, double >( referencePointName, time );
+                            };
+                        }
+                    }
+
+                    if( bodyFixedReferencePointStateFunction != nullptr )
+                    {
+                        linkEndReferencePointOffsetFunctions.push_back( [ = ]( const double time ) {
+                            return Eigen::Vector3d( ephemerides::transformStateToInertialOrientation< double, double >(
+                                                            bodyFixedReferencePointStateFunction( time ), time, linkEndBody->getRotationalEphemeris( ) )
+                                                            .segment( 0, 3 ) );
+                        } );
+                    }
+                    else
+                    {
+                        linkEndReferencePointOffsetFunctions.push_back( nullptr );
+                    }
+                }
+                std::dynamic_pointer_cast< DsnNWayAveragedDopplerObservationModel< ObservationScalarType, TimeType > >( observationModel )
+                        ->setLinkEndDisplacementFunctions( linkEndBodyStateFunctions, linkEndReferencePointOffsetFunctions );
                 break;
             }
             case dsn_n_way_range: {

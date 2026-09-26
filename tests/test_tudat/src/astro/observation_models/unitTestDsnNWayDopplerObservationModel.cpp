@@ -289,6 +289,107 @@ BOOST_AUTO_TEST_CASE( testDsnNWayAveragedDopplerModel )
     }
 }
 
+// Numerical consistency of the averaged observable for short count times. The observable is formed from the change of the
+// signal path over the count; it must not inherit the rounding (~1E-12 s) of the light times at the start and end of the
+// count, which for 1-s counts corresponds to several mHz. Checks, in double precision:
+//  - the numerical noise of consecutive 1-s counts (from their fourth differences, which remove the smooth signal),
+//  - the additivity of the counted phase: the mean of 60 consecutive 1-s counts equals the 60-s count they tile.
+BOOST_AUTO_TEST_CASE( testDsnNWayAveragedDopplerShortCountNumericalNoise )
+{
+    using namespace observation_models;
+
+    spice_interface::loadStandardSpiceKernels( );
+    spice_interface::loadSpiceKernelInTudat( tudat::paths::getTudatTestDataPath( ) +
+                                             "dsn_n_way_doppler_observation_model/mgs_map1_ipng_mgs95j.bsp" );
+
+    std::string spacecraftName = "MGS";
+    BodyListSettings bodySettings = getDefaultBodySettings( { "Earth", "Sun", "Mars" }, "SSB", "J2000" );
+    bodySettings.at( "Earth" )->shapeModelSettings = fromSpiceOblateSphericalBodyShapeSettings( );
+    bodySettings.at( "Earth" )->rotationModelSettings = gcrsToItrsRotationModelSettings( basic_astrodynamics::iau_2006, "J2000" );
+    bodySettings.at( "Earth" )->groundStationSettings = getDsnStationSettings( );
+    bodySettings.addSettings( spacecraftName );
+    bodySettings.at( spacecraftName )->ephemerisSettings = std::make_shared< DirectSpiceEphemerisSettings >( "SSB", "J2000" );
+    SystemOfBodies bodies = createSystemOfBodies< double, Time >( bodySettings );
+
+    // Ramps, turnaround ratios and link information from an ODF file
+    std::vector< std::shared_ptr< input_output::OdfRawFileContents > > rawOdfDataVector = { std::make_shared< OdfRawFileContents >(
+            tudat::paths::getTudatTestDataPath( ) + "dsn_n_way_doppler_observation_model/9068068a.odf" ) };
+    std::shared_ptr< ProcessedOdfFileContents< Time > > processedOdfFileContents =
+            std::make_shared< ProcessedOdfFileContents< Time > >( rawOdfDataVector, spacecraftName );
+    std::shared_ptr< ObservationCollection< double, Time > > observedObservationCollection =
+            createOdfObservedObservationCollection< double, Time >( processedOdfFileContents, { dsn_n_way_averaged_doppler } );
+    setOdfInformationInBodies< Time >( processedOdfFileContents, bodies );
+
+    LinkEnds linkEnds;
+    linkEnds[ transmitter ] = LinkEndId( "Earth", "DSS-45" );
+    linkEnds[ retransmitter ] = LinkEndId( spacecraftName );
+    linkEnds[ receiver ] = LinkEndId( "Earth", "DSS-45" );
+    std::shared_ptr< SingleObservationSet< double, Time > > referenceSet =
+            observedObservationCollection->getSingleLinkAndTypeObservationSets( dsn_n_way_averaged_doppler, linkEnds ).at( 0 );
+    std::shared_ptr< ObservationAncilliarySimulationSettings > referenceAncillarySettings = referenceSet->getAncilliarySettings( );
+    std::vector< FrequencyBands > frequencyBands =
+            convertDoubleVectorToFrequencyBands( referenceAncillarySettings->getAncilliaryDoubleVectorData( frequency_bands ) );
+    FrequencyBands referenceBand =
+            convertDoubleToFrequencyBand( referenceAncillarySettings->getAncilliaryDoubleData( reception_reference_frequency_band ) );
+    double referenceFrequency = referenceAncillarySettings->getAncilliaryDoubleData( doppler_reference_frequency );
+    Time referenceTime = referenceSet->getObservationTimes( ).at( referenceSet->getObservationTimes( ).size( ) / 2 );
+
+    std::vector< std::shared_ptr< ObservationModelSettings > > observationModelSettings = {
+        std::make_shared< DsnNWayAveragedDopplerObservationModelSettings >( linkEnds ) };
+    std::vector< std::shared_ptr< ObservationSimulatorBase< double, Time > > > observationSimulators =
+            createObservationSimulators< double, Time >( observationModelSettings, bodies );
+
+    // Tags of 60 consecutive 1-s counts tiling (in UTC at the station) the 60-s count centered at the reference time
+    std::shared_ptr< earth_orientation::TerrestrialTimeScaleConverter > timeScaleConverter =
+            earth_orientation::createDefaultTimeConverter( );
+    Eigen::Vector3d stationPosition =
+            bodies.getBody( "Earth" )->getGroundStation( "DSS-45" )->getNominalStationState( )->getNominalCartesianPosition( );
+    Time referenceUtcTime = timeScaleConverter->getCurrentTime< Time >(
+            basic_astrodynamics::tdb_scale, basic_astrodynamics::utc_scale, referenceTime, stationPosition );
+    const int numberOfShortCounts = 60;
+    std::vector< Time > shortCountTimes;
+    for( int i = 0; i < numberOfShortCounts; i++ )
+    {
+        shortCountTimes.push_back( timeScaleConverter->getCurrentTime< Time >( basic_astrodynamics::utc_scale,
+                                                                                basic_astrodynamics::tdb_scale,
+                                                                                referenceUtcTime + ( -29.5 + static_cast< double >( i ) ),
+                                                                                stationPosition ) );
+    }
+
+    auto simulate = [ & ]( const std::vector< Time >& times, const double countTime ) {
+        std::vector< std::shared_ptr< ObservationSimulationSettings< Time > > > simulationSettings = {
+            std::make_shared< TabulatedObservationSimulationSettings< Time > >(
+                    dsn_n_way_averaged_doppler,
+                    linkEnds,
+                    times,
+                    receiver,
+                    std::vector< std::shared_ptr< ObservationViabilitySettings > >( ),
+                    nullptr,
+                    getDsnNWayAveragedDopplerAncillarySettings( frequencyBands, referenceBand, referenceFrequency, countTime ) ) };
+        return simulateObservations< double, Time >( simulationSettings, observationSimulators, bodies )->getObservationVector( );
+    };
+    Eigen::VectorXd shortCounts = simulate( shortCountTimes, 1.0 );
+    Eigen::VectorXd longCount = simulate( { referenceTime }, 60.0 );
+
+    // Numerical noise of the 1-s counts, from their fourth differences, which remove the smooth Doppler signal (std of a fourth
+    // difference of white noise: sqrt(70) sigma)
+    double sumOfSquares = 0.0;
+    for( int i = 0; i < numberOfShortCounts - 4; i++ )
+    {
+        double fourthDifference = shortCounts( i + 4 ) - 4.0 * shortCounts( i + 3 ) + 6.0 * shortCounts( i + 2 ) -
+                4.0 * shortCounts( i + 1 ) + shortCounts( i );
+        sumOfSquares += fourthDifference * fourthDifference;
+    }
+    double shortCountNoise = std::sqrt( sumOfSquares / ( numberOfShortCounts - 4 ) / 70.0 );
+    std::cout << "1-s count numerical noise: " << shortCountNoise * 1.0E3 << " mHz" << std::endl;
+    BOOST_CHECK_SMALL( shortCountNoise, 5.0E-5 );
+
+    // Additivity of the counted phase
+    double meanOfShortCounts = shortCounts.mean( );
+    std::cout << "Mean of 1-s counts - 60-s count: " << ( meanOfShortCounts - longCount( 0 ) ) * 1.0E3 << " mHz" << std::endl;
+    BOOST_CHECK_SMALL( meanOfShortCounts - longCount( 0 ), 1.0E-5 );
+}
+
 BOOST_AUTO_TEST_SUITE_END( )
 
 }  // namespace unit_tests
