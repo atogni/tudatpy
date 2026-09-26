@@ -292,7 +292,7 @@ BOOST_AUTO_TEST_CASE( testDsnNWayAveragedDopplerModel )
 // Numerical consistency of the averaged observable for short count times. The observable is formed from the change of the
 // signal path over the count; it must not inherit the rounding (~1E-12 s) of the light times at the start and end of the
 // count, which for 1-s counts corresponds to several mHz. Checks, in double precision:
-//  - the numerical noise of consecutive 1-s counts (from their third differences; the signal is smooth over a few seconds),
+//  - the numerical noise of consecutive 1-s counts (from their fourth differences, which remove the smooth signal),
 //  - the additivity of the counted phase: the mean of 60 consecutive 1-s counts equals the 60-s count they tile.
 BOOST_AUTO_TEST_CASE( testDsnNWayAveragedDopplerShortCountNumericalNoise )
 {
