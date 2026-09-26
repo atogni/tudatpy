@@ -15,8 +15,12 @@
 #ifndef TUDAT_DSNNWAYAVERAGEDDOPPLEROBSERVATIONMODEL_H
 #define TUDAT_DSNNWAYAVERAGEDDOPPLEROBSERVATIONMODEL_H
 
+#include <cmath>
+#include <iostream>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "tudat/simulation/simulation.h"
 
@@ -24,6 +28,7 @@
 #include "tudat/astro/observation_models/observationFrequencies.h"
 #include "tudat/astro/observation_models/nWayRangeObservationModel.h"
 #include "tudat/astro/observation_models/transmissionFrequencyInterface.h"
+#include "tudat/interface/sofa/sofaTimeConversions.h"
 
 namespace tudat
 {
@@ -107,6 +112,50 @@ inline double getDsnNWayAveragedDopplerScalingFactor(
     return frequency / integrationTime / physical_constants::getSpeedOfLight< double >( );
 }
 
+/*! Compute the nodes and weights of an n-point Gauss-Legendre quadrature on [-1, 1].
+ *
+ * Nodes are the roots of the Legendre polynomial P_n, found by Newton iteration (in long double); the weights are
+ * 2 / ( ( 1 - x^2 ) P_n'(x)^2 ).
+ *
+ * @param numberOfNodes Number of quadrature nodes (n >= 1)
+ * @param nodes Quadrature nodes (output)
+ * @param weights Quadrature weights (output)
+ */
+inline void computeGaussLegendreNodesAndWeights( const unsigned int numberOfNodes,
+                                                 std::vector< long double >& nodes,
+                                                 std::vector< long double >& weights )
+{
+    const long double pi = 3.141592653589793238462643383279502884L;
+    nodes.assign( numberOfNodes, 0.0L );
+    weights.assign( numberOfNodes, 0.0L );
+    for( unsigned int i = 0; i < ( numberOfNodes + 1 ) / 2; i++ )
+    {
+        long double z = std::cos( pi * ( static_cast< long double >( i ) + 0.75L ) / ( static_cast< long double >( numberOfNodes ) + 0.5L ) );
+        long double derivative = 1.0L;
+        for( unsigned int iteration = 0; iteration < 100; iteration++ )
+        {
+            long double currentValue = 1.0L, previousValue = 0.0L;
+            for( unsigned int j = 1; j <= numberOfNodes; j++ )
+            {
+                long double olderValue = previousValue;
+                previousValue = currentValue;
+                currentValue = ( ( 2.0L * j - 1.0L ) * z * previousValue - ( j - 1.0L ) * olderValue ) / j;
+            }
+            derivative = numberOfNodes * ( z * currentValue - previousValue ) / ( z * z - 1.0L );
+            long double previousZ = z;
+            z = previousZ - currentValue / derivative;
+            if( std::fabs( z - previousZ ) < 1.0E-18L )
+            {
+                break;
+            }
+        }
+        nodes.at( i ) = -z;
+        nodes.at( numberOfNodes - 1 - i ) = z;
+        weights.at( i ) = 2.0L / ( ( 1.0L - z * z ) * derivative * derivative );
+        weights.at( numberOfNodes - 1 - i ) = weights.at( i );
+    }
+}
+
 template< typename ObservationScalarType = double, typename TimeType = Time >
 class DsnNWayAveragedDopplerObservationModel : public ObservationModel< 1, ObservationScalarType, TimeType >
 {
@@ -152,6 +201,32 @@ public:
                     std::to_string( numberOfLinkEnds_ ) + "were selected." );
         }
         terrestrialTimeScaleConverter_ = earth_orientation::createDefaultTimeConverter( );
+
+        computeGaussLegendreNodesAndWeights( numberOfQuadratureNodes_, quadratureNodes_, quadratureWeights_ );
+    }
+
+    /*! Set the functions used to compute the change of the signal path over the count without differencing light times.
+     *
+     * If set, the length of the transmission interval is computed from the displacement of each link end over the count
+     * (see computeTransmissionUtcIntervalLength), which is free of the rounding errors of the (large) light times.
+     * Otherwise, it is computed from the difference of the light times at the start and end of the count.
+     *
+     * @param linkEndBodyStateFunctions For each link end (in n-way order, transmitter first), function returning the
+     *      state of the body on which the link end is located (in the global frame).
+     * @param linkEndReferencePointOffsetFunctions For each link end, function returning the position of the link end
+     *      w.r.t. the center of its body (in the global frame orientation), or nullptr if the link end is the body center.
+     */
+    void setLinkEndDisplacementFunctions(
+            const std::vector< std::function< Eigen::Vector6d( const double ) > >& linkEndBodyStateFunctions,
+            const std::vector< std::function< Eigen::Vector3d( const double ) > >& linkEndReferencePointOffsetFunctions )
+    {
+        if( linkEndBodyStateFunctions.size( ) != numberOfLinkEnds_ || linkEndReferencePointOffsetFunctions.size( ) != numberOfLinkEnds_ )
+        {
+            throw std::runtime_error( "Error when setting link end displacement functions of DSN N-way averaged Doppler model, size is "
+                                      "inconsistent with number of link ends." );
+        }
+        linkEndBodyStateFunctions_ = linkEndBodyStateFunctions;
+        linkEndReferencePointOffsetFunctions_ = linkEndReferencePointOffsetFunctions;
     }
 
     //! Destructor
@@ -264,6 +339,10 @@ public:
                         0, 0 ) /
                 physical_constants::getSpeedOfLight< ObservationScalarType >( );
 
+        // Light time and light-time correction of each leg at the start of the count
+        std::vector< ObservationScalarType > arcStartLegLightTimes, arcStartLegCorrections;
+        getLegLightTimesAndCorrections( arcStartObservationModel_, arcStartLegLightTimes, arcStartLegCorrections );
+
         // Set frequencies for ionosphere/corona
         if( arcEndObservationModel_->getMultiLegLightTimeCalculator( )->doCorrectionsNeedFrequency( ) )
         {
@@ -281,6 +360,10 @@ public:
                                                                                                                                       0 ) /
                 physical_constants::getSpeedOfLight< ObservationScalarType >( );
 
+        // Light time and light-time correction of each leg at the end of the count
+        std::vector< ObservationScalarType > arcEndLegLightTimes, arcEndLegCorrections;
+        getLegLightTimesAndCorrections( arcEndObservationModel_, arcEndLegLightTimes, arcEndLegCorrections );
+
         // Moyer (2000), eqs. 13-52 and 13-53
         TimeType transmissionTdbStartTime = receptionTdbStartTime - startLightTime;
         TimeType transmissionTdbEndTime = receptionTdbEndTime - endLightTime;
@@ -290,9 +373,66 @@ public:
         TimeType transmissionUtcEndTime = terrestrialTimeScaleConverter_->getCurrentTime< TimeType >(
                 basic_astrodynamics::tdb_scale, basic_astrodynamics::utc_scale, transmissionTdbEndTime, nominalTransmittingStationState );
 
-        ObservationScalarType transmitterFrequencyIntegral =
-                transmittingFrequencyCalculator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >(
-                        transmissionUtcStartTime, transmissionUtcEndTime );
+        ObservationScalarType transmitterFrequencyIntegral;
+        if( linkEndBodyStateFunctions_.size( ) != numberOfLinkEnds_ )
+        {
+            transmitterFrequencyIntegral =
+                    transmittingFrequencyCalculator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >(
+                            transmissionUtcStartTime, transmissionUtcEndTime );
+        }
+        else
+        {
+            // The interval [transmissionUtcStartTime, transmissionUtcEndTime] above follows from differencing two light times
+            // of up to several hours, whose rounding (~1E-12 s each, from the link end positions and the light time itself)
+            // dominates the numerical error of this observable for short count times. Its length is instead computed from
+            // quantities that are small by construction (see computeTransmissionUtcIntervalLength). The start time is kept:
+            // an error in the placement of the interval only enters through the change of the frequency over that error.
+            displacementCheckFailed_ = false;
+            ObservationScalarType transmissionUtcIntervalLength = computeTransmissionUtcIntervalLength(
+                    static_cast< ObservationScalarType >( integrationTime ),
+                    receptionUtcStartTime,
+                    receptionUtcEndTime,
+                    receptionTdbStartTime,
+                    receptionTdbEndTime,
+                    transmissionTdbStartTime,
+                    transmissionTdbEndTime,
+                    transmissionUtcStartTime,
+                    transmissionUtcEndTime,
+                    nominalReceivingStationState,
+                    nominalTransmittingStationState,
+                    arcStartLinkEndTimes,
+                    arcStartLinkEndStates,
+                    arcStartLegLightTimes,
+                    arcEndLegLightTimes,
+                    arcStartLegCorrections,
+                    arcEndLegCorrections );
+
+            // If the velocity of a link-end body is not consistent with its position, use the legacy interval
+            if( displacementCheckFailed_ )
+            {
+                if( !displacementCheckWarningGiven_ )
+                {
+                    std::cerr << "Warning in DSN N-way averaged Doppler model: ephemeris velocity of a link-end body is inconsistent "
+                                 "with its position (displacement over the count differs by more than "
+                              << maximumDisplacementDiscrepancy_
+                              << " m); using the difference of the light times at the start and end of the count instead."
+                              << std::endl;
+                    displacementCheckWarningGiven_ = true;
+                }
+                transmissionUtcIntervalLength = static_cast< ObservationScalarType >( transmissionUtcEndTime - transmissionUtcStartTime );
+            }
+
+            // Integrate the frequency over an interval of this length. The end time is corrected to first order for its
+            // rounding when represented as a TimeType (relevant if the seconds of the TimeType are a double).
+            TimeType transmissionUtcIntervalEndTime = transmissionUtcStartTime + transmissionUtcIntervalLength;
+            transmitterFrequencyIntegral =
+                    transmittingFrequencyCalculator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >(
+                            transmissionUtcStartTime, transmissionUtcIntervalEndTime ) +
+                    transmittingFrequencyCalculator_->template getTemplatedCurrentFrequency< ObservationScalarType, TimeType >(
+                            transmissionUtcIntervalEndTime ) *
+                            ( transmissionUtcIntervalLength -
+                              static_cast< ObservationScalarType >( transmissionUtcIntervalEndTime - transmissionUtcStartTime ) );
+        }
 
         // Moyer (2000), eq. 13-54
         Eigen::Matrix< ObservationScalarType, 1, 1 > observation =
@@ -333,6 +473,206 @@ public:
     }
 
 private:
+    // Retrieve the light time and light-time correction of each leg of the last solution of the given n-way range model
+    void getLegLightTimesAndCorrections( const std::shared_ptr< NWayRangeObservationModel< ObservationScalarType, TimeType > > nWayRangeModel,
+                                         std::vector< ObservationScalarType >& legLightTimes,
+                                         std::vector< ObservationScalarType >& legCorrections )
+    {
+        legLightTimes.clear( );
+        legCorrections.clear( );
+        for( auto legCalculator: nWayRangeModel->getMultiLegLightTimeCalculator( )->getLightTimeCalculators( ) )
+        {
+            legLightTimes.push_back( legCalculator->getCurrentIdealLightTime( ) + legCalculator->getCurrentLightTimeCorrection( ) );
+            legCorrections.push_back( legCalculator->getCurrentLightTimeCorrection( ) );
+        }
+    }
+
+    // Displacement of the body (center) of the given link end over [startTime, startTime + intervalLength], by composite
+    // Gauss-Legendre quadrature of its velocity
+    Eigen::Matrix< ObservationScalarType, 3, 1 > computeBodyDisplacement( const unsigned int linkEndIndex,
+                                                                        const double startTime,
+                                                                        const ObservationScalarType intervalLength )
+    {
+        unsigned int numberOfSubintervals = 1;
+        if( maximumQuadratureSubintervalLength_ > 0.0 )
+        {
+            numberOfSubintervals = std::max(
+                    1, static_cast< int >( std::ceil( std::fabs( static_cast< double >( intervalLength ) ) / maximumQuadratureSubintervalLength_ ) ) );
+        }
+        ObservationScalarType subintervalLength = intervalLength / static_cast< ObservationScalarType >( numberOfSubintervals );
+
+        Eigen::Matrix< ObservationScalarType, 3, 1 > displacement = Eigen::Matrix< ObservationScalarType, 3, 1 >::Zero( );
+        for( unsigned int subinterval = 0; subinterval < numberOfSubintervals; subinterval++ )
+        {
+            ObservationScalarType subintervalCenter = ( static_cast< ObservationScalarType >( subinterval ) + 0.5 ) * subintervalLength;
+            for( unsigned int node = 0; node < quadratureNodes_.size( ); node++ )
+            {
+                double nodeTime = startTime +
+                        static_cast< double >( subintervalCenter +
+                                               static_cast< ObservationScalarType >( quadratureNodes_.at( node ) ) * subintervalLength / 2.0 );
+                displacement += static_cast< ObservationScalarType >( quadratureWeights_.at( node ) ) * subintervalLength / 2.0 *
+                        linkEndBodyStateFunctions_.at( linkEndIndex )( nodeTime ).segment( 3, 3 ).template cast< ObservationScalarType >( );
+            }
+        }
+
+        // Check against the difference of the positions (rounded, but free of any inconsistency between the velocity and
+        // position of the ephemeris, e.g. a custom ephemeris with zero or approximate velocity)
+        double endTime = startTime + static_cast< double >( intervalLength );
+        Eigen::Vector6d startState = linkEndBodyStateFunctions_.at( linkEndIndex )( startTime );
+        Eigen::Vector6d endState = linkEndBodyStateFunctions_.at( linkEndIndex )( endTime );
+        Eigen::Vector3d positionDifference = endState.segment( 0, 3 ) - startState.segment( 0, 3 ) +
+                endState.segment( 3, 3 ) * ( static_cast< double >( intervalLength ) - ( endTime - startTime ) );
+        double displacementDiscrepancy = ( displacement.template cast< double >( ) - positionDifference ).norm( );
+        if( displacementDiscrepancy > maximumDisplacementDiscrepancy_ )
+        {
+            displacementCheckFailed_ = true;
+        }
+        return displacement;
+    }
+
+    // Change of the position of the given link end w.r.t. its body over [startTime, startTime + intervalLength] (zero if the
+    // link end is the body center). The positions are small, so they can be differenced directly; the end time is corrected
+    // (to first order) for its rounding when represented as a double.
+    Eigen::Matrix< ObservationScalarType, 3, 1 > computeReferencePointDisplacement( const unsigned int linkEndIndex,
+                                                                                  const double startTime,
+                                                                                  const ObservationScalarType intervalLength )
+    {
+        if( linkEndReferencePointOffsetFunctions_.at( linkEndIndex ) == nullptr )
+        {
+            return Eigen::Matrix< ObservationScalarType, 3, 1 >::Zero( );
+        }
+        double endTime = startTime + static_cast< double >( intervalLength );
+        Eigen::Matrix< ObservationScalarType, 3, 1 > displacement =
+                ( linkEndReferencePointOffsetFunctions_.at( linkEndIndex )( endTime ) -
+                  linkEndReferencePointOffsetFunctions_.at( linkEndIndex )( startTime ) )
+                        .template cast< ObservationScalarType >( );
+        ObservationScalarType representedLength = static_cast< ObservationScalarType >( endTime - startTime );
+        if( representedLength != 0.0 )
+        {
+            displacement += displacement / representedLength * ( intervalLength - representedLength );
+        }
+        return displacement;
+    }
+
+    /*! Compute the length (in UTC at the transmitting station) of the transmission interval of the count.
+     *
+     * The length is L_T = L_R - sum_j ( Delta rho_j / c + Delta C_j ) - Delta( TDB - UTC )_T, with
+     *  - L_R = T + Delta( TDB - UTC )_R the length of the reception interval in TDB (T the count time in UTC),
+     *  - Delta rho_j the change of the Euclidean length of leg j over the count, from the change of the leg vector,
+     *    Delta r_j = Delta x_R - Delta x_T. The displacement of each link end over its own interval is the displacement of
+     *    its body (quadrature of the body velocity) plus the change of its position w.r.t. the body (a small vector);
+     *    Delta rho_j = ( 2 r_j . Delta r_j + |Delta r_j|^2 ) / ( |r_j + Delta r_j| + |r_j| ), with r_j the leg vector at
+     *    the start of the count,
+     *  - Delta C_j the change of the light-time correction of leg j between the solutions at the start and end of the
+     *    count (retransmission delays are constant and do not contribute),
+     *  - Delta( TDB - UTC ) the change of TDB - TT over the interval at the station (plus any leap second).
+     * None of these terms requires differencing the two (large) light times at the start and end of the count; the
+     * interval of each link end uses the (rounded) light times, whose error only enters multiplied by v/c.
+     */
+    ObservationScalarType computeTransmissionUtcIntervalLength( const ObservationScalarType integrationTime,
+                                                                const TimeType receptionUtcStartTime,
+                                                                const TimeType receptionUtcEndTime,
+                                                                const TimeType receptionTdbStartTime,
+                                                                const TimeType receptionTdbEndTime,
+                                                                const TimeType transmissionTdbStartTime,
+                                                                const TimeType transmissionTdbEndTime,
+                                                                const TimeType transmissionUtcStartTime,
+                                                                const TimeType transmissionUtcEndTime,
+                                                                const Eigen::Vector3d& nominalReceivingStationState,
+                                                                const Eigen::Vector3d& nominalTransmittingStationState,
+                                                                const std::vector< double >& arcStartLinkEndTimes,
+                                                                const std::vector< Eigen::Matrix< double, 6, 1 > >& arcStartLinkEndStates,
+                                                                const std::vector< ObservationScalarType >& arcStartLegLightTimes,
+                                                                const std::vector< ObservationScalarType >& arcEndLegLightTimes,
+                                                                const std::vector< ObservationScalarType >& arcStartLegCorrections,
+                                                                const std::vector< ObservationScalarType >& arcEndLegCorrections )
+    {
+        // Length of the reception interval in TDB: change of TDB - TT over the interval (plus the change in leap seconds,
+        // an integer obtained from the direct difference of the converted times)
+        double receptionTdbMinusTtChange =
+                sofa_interface::getTDBminusTT( static_cast< double >( receptionTdbEndTime ), nominalReceivingStationState ) -
+                sofa_interface::getTDBminusTT( static_cast< double >( receptionTdbStartTime ), nominalReceivingStationState );
+        double receptionLeapSecondChange = std::round(
+                static_cast< double >( ( receptionTdbEndTime - receptionTdbStartTime ) - ( receptionUtcEndTime - receptionUtcStartTime ) ) -
+                receptionTdbMinusTtChange );
+        ObservationScalarType receptionTdbIntervalLength = integrationTime + static_cast< ObservationScalarType >( receptionTdbMinusTtChange ) +
+                static_cast< ObservationScalarType >( receptionLeapSecondChange );
+
+        // Change of each leg's light time, moving from the receiver to the transmitter
+        const unsigned int numberOfLegs = arcStartLegLightTimes.size( );
+        ObservationScalarType legIntervalLength = receptionTdbIntervalLength;
+        ObservationScalarType totalLightTimeChange = mathematical_constants::getFloatingInteger< ObservationScalarType >( 0 );
+        for( int leg = static_cast< int >( numberOfLegs ) - 1; leg >= 0; leg-- )
+        {
+            // Link end intervals of this leg: the reception interval is that of the transmission of the next leg (or of the
+            // count), the transmission interval uses the change of the (rounded) light time of the leg
+            ObservationScalarType legReceptionIntervalLength = legIntervalLength;
+            ObservationScalarType legTransmissionIntervalLength =
+                    legReceptionIntervalLength - ( arcEndLegLightTimes.at( leg ) - arcStartLegLightTimes.at( leg ) );
+
+            // Change of the leg vector over the count
+            Eigen::Matrix< ObservationScalarType, 3, 1 > legVectorChange =
+                    ( computeBodyDisplacement( leg + 1, arcStartLinkEndTimes.at( 2 * leg + 1 ), legReceptionIntervalLength ) +
+                      computeReferencePointDisplacement( leg + 1, arcStartLinkEndTimes.at( 2 * leg + 1 ), legReceptionIntervalLength ) ) -
+                    ( computeBodyDisplacement( leg, arcStartLinkEndTimes.at( 2 * leg ), legTransmissionIntervalLength ) +
+                      computeReferencePointDisplacement( leg, arcStartLinkEndTimes.at( 2 * leg ), legTransmissionIntervalLength ) );
+
+            // Change of the Euclidean leg length, computed without differencing the (large) lengths themselves
+            Eigen::Matrix< ObservationScalarType, 3, 1 > legVector =
+                    ( arcStartLinkEndStates.at( 2 * leg + 1 ).segment( 0, 3 ) - arcStartLinkEndStates.at( 2 * leg ).segment( 0, 3 ) )
+                            .template cast< ObservationScalarType >( );
+            ObservationScalarType legLengthChange =
+                    ( 2.0 * legVector.dot( legVectorChange ) + legVectorChange.dot( legVectorChange ) ) /
+                    ( ( legVector + legVectorChange ).norm( ) + legVector.norm( ) );
+
+            ObservationScalarType legLightTimeChange = legLengthChange / physical_constants::getSpeedOfLight< ObservationScalarType >( ) +
+                    ( arcEndLegCorrections.at( leg ) - arcStartLegCorrections.at( leg ) );
+            totalLightTimeChange += legLightTimeChange;
+
+            // Transmission interval of this leg is the reception interval of the previous one (retransmission delays constant)
+            legIntervalLength = legReceptionIntervalLength - legLightTimeChange;
+        }
+
+        // Length of the transmission interval in TDB
+        ObservationScalarType transmissionTdbIntervalLength = receptionTdbIntervalLength - totalLightTimeChange;
+
+        // Length of the transmission interval in UTC
+        double transmissionTdbMinusTtChange =
+                sofa_interface::getTDBminusTT(
+                        static_cast< double >( transmissionTdbStartTime ) + static_cast< double >( transmissionTdbIntervalLength ),
+                        nominalTransmittingStationState ) -
+                sofa_interface::getTDBminusTT( static_cast< double >( transmissionTdbStartTime ), nominalTransmittingStationState );
+        double transmissionLeapSecondChange =
+                std::round( static_cast< double >( ( transmissionTdbEndTime - transmissionTdbStartTime ) -
+                                                   ( transmissionUtcEndTime - transmissionUtcStartTime ) ) -
+                            transmissionTdbMinusTtChange );
+        return transmissionTdbIntervalLength - static_cast< ObservationScalarType >( transmissionTdbMinusTtChange ) -
+                static_cast< ObservationScalarType >( transmissionLeapSecondChange );
+    }
+
+    // For each link end (n-way order), function returning the state of its body in the global frame
+    std::vector< std::function< Eigen::Vector6d( const double ) > > linkEndBodyStateFunctions_;
+
+    // For each link end (n-way order), function returning its position w.r.t. its body (nullptr for a body center)
+    std::vector< std::function< Eigen::Vector3d( const double ) > > linkEndReferencePointOffsetFunctions_;
+
+    // Number of Gauss-Legendre nodes (per subinterval) used to compute the displacement of the link-end bodies
+    unsigned int numberOfQuadratureNodes_ = 8;
+
+    // Maximum length of a quadrature subinterval (s); longer intervals use a composite rule
+    double maximumQuadratureSubintervalLength_ = 60.0;
+
+    // Maximum difference (m) between the displacement of a link-end body from its velocity and from its positions
+    double maximumDisplacementDiscrepancy_ = 1.0E-2;
+
+    // Whether the displacement check failed for the current observation, and whether a warning was given
+    bool displacementCheckFailed_ = false;
+    bool displacementCheckWarningGiven_ = false;
+
+    // Gauss-Legendre nodes and weights on [-1, 1]
+    std::vector< long double > quadratureNodes_;
+    std::vector< long double > quadratureWeights_;
+
     // N-way range observation model associated with the start of the Doppler integration time.
     std::shared_ptr< NWayRangeObservationModel< ObservationScalarType, TimeType > > arcStartObservationModel_;
 
