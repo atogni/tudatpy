@@ -15,8 +15,11 @@
 #ifndef TUDAT_DSNNWAYAVERAGEDDOPPLEROBSERVATIONMODEL_H
 #define TUDAT_DSNNWAYAVERAGEDDOPPLEROBSERVATIONMODEL_H
 
+#include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "tudat/astro/ground_stations/groundStationState.h"
 #include "tudat/astro/ground_stations/transmittingFrequencies.h"
@@ -24,6 +27,7 @@
 #include "tudat/astro/observation_models/observationFrequencies.h"
 #include "tudat/astro/observation_models/nWayRangeObservationModel.h"
 #include "tudat/astro/observation_models/transmissionFrequencyInterface.h"
+#include "tudat/interface/sofa/sofaTimeConversions.h"
 
 namespace tudat
 {
@@ -303,9 +307,37 @@ public:
         TimeType transmissionUtcEndTime = timeScaleConverter_->template getCurrentTime< TimeType >(
                 basic_astrodynamics::tdb_scale, basic_astrodynamics::utc_scale, transmissionTdbEndTime, nominalTransmittingStationState );
 
-        ObservationScalarType transmitterFrequencyIntegral =
-                frequencyInterpolator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >( transmissionUtcStartTime,
-                                                                                                                   transmissionUtcEndTime );
+        ObservationScalarType transmitterFrequencyIntegral;
+        ObservationScalarType transmissionUtcIntervalLength = computeTransmissionUtcIntervalLength( integrationTime,
+                                                                                                    receptionTdbStartTime,
+                                                                                                    receptionTdbEndTime,
+                                                                                                    transmissionTdbStartTime,
+                                                                                                    transmissionTdbEndTime,
+                                                                                                    transmissionUtcStartTime,
+                                                                                                    transmissionUtcEndTime,
+                                                                                                    nominalReceivingStationState,
+                                                                                                    nominalTransmittingStationState,
+                                                                                                    arcStartLinkEndTimes,
+                                                                                                    arcStartLinkEndStates );
+        if( std::isnan( transmissionUtcIntervalLength ) )
+        {
+            transmitterFrequencyIntegral =
+                    frequencyInterpolator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >(
+                            transmissionUtcStartTime, transmissionUtcEndTime );
+        }
+        else
+        {
+            // Integrate over an interval of the computed length; the end time is corrected to first order for its rounding
+            // when represented as a TimeType
+            TimeType transmissionUtcIntervalEndTime = transmissionUtcStartTime + transmissionUtcIntervalLength;
+            transmitterFrequencyIntegral =
+                    frequencyInterpolator_->template getTemplatedFrequencyIntegral< ObservationScalarType, TimeType >(
+                            transmissionUtcStartTime, transmissionUtcIntervalEndTime ) +
+                    frequencyInterpolator_->template getTemplatedCurrentFrequency< ObservationScalarType, TimeType >(
+                            transmissionUtcIntervalEndTime ) *
+                            ( transmissionUtcIntervalLength -
+                              static_cast< ObservationScalarType >( transmissionUtcIntervalEndTime - transmissionUtcStartTime ) );
+        }
 
         // Moyer (2000), eq. 13-54
         Eigen::Matrix< ObservationScalarType, 1, 1 > observation =
@@ -350,6 +382,17 @@ public:
         return subtractDopplerSignature_;
     }
 
+    /*! Set the link-end motion (per link end, transmitter first: body state in the global frame; position w.r.t. the body, or
+     * nullptr for a body center), used to compute the light-time change over the count from link-end displacements instead
+     * of differencing the two light times, whose rounding dominates the numerical error at short count times.
+     */
+    void setLinkEndMotionFunctions( const std::vector< std::function< Eigen::Vector6d( const double ) > >& linkEndBodyStateFunctions,
+                                    const std::vector< std::function< Eigen::Vector3d( const double ) > >& linkEndStationPositionFunctions )
+    {
+        linkEndBodyStateFunctions_ = linkEndBodyStateFunctions;
+        linkEndStationPositionFunctions_ = linkEndStationPositionFunctions;
+    }
+
     std::map< std::pair< LinkEndType, LinkEndType >, std::vector< std::shared_ptr< LightTimeCalculatorBase > > >
     getLegLightTimeCalculators( ) const override
     {
@@ -366,6 +409,123 @@ public:
     }
 
 private:
+    /*! Length (UTC at the transmitter) of the transmission interval, Moyer (2000) eq. 13-51, without differencing the two light
+     * times (NaN if no link-end motion is set or a body's velocity is inconsistent with its positions: the caller then
+     * differences them). Light-time change of leg j: Delta rho_j / c + Delta C_j, with
+     * Delta rho_j = ( 2 r_j . Delta r_j + |Delta r_j|^2 ) / ( |r_j + Delta r_j| + |r_j| ) and Delta r_j from the link-end
+     * displacements (body velocity integrated by Gauss-Legendre quadrature, plus the change of the position w.r.t. the body).
+     */
+    ObservationScalarType computeTransmissionUtcIntervalLength( const TimeType integrationTime,
+                                                                const TimeType receptionTdbStartTime,
+                                                                const TimeType receptionTdbEndTime,
+                                                                const TimeType transmissionTdbStartTime,
+                                                                const TimeType transmissionTdbEndTime,
+                                                                const TimeType transmissionUtcStartTime,
+                                                                const TimeType transmissionUtcEndTime,
+                                                                const Eigen::Vector3d& receivingStationPosition,
+                                                                const Eigen::Vector3d& transmittingStationPosition,
+                                                                const std::vector< double >& arcStartLinkEndTimes,
+                                                                const std::vector< Eigen::Matrix< double, 6, 1 > >& arcStartLinkEndStates )
+    {
+        if( linkEndBodyStateFunctions_.size( ) != 3 )
+        {
+            return TUDAT_NAN;
+        }
+        // 5-point Gauss-Legendre quadrature on [-1, 1]
+        const double nodes[ 5 ] = { -0.9061798459386640, -0.5384693101056831, 0.0, 0.5384693101056831, 0.9061798459386640 };
+        const double weights[ 5 ] = { 0.2369268850561891, 0.4786286704993665, 0.5688888888888889, 0.4786286704993665, 0.2369268850561891 };
+
+        // Reception interval in TDB: count time plus the change of TDB - TT (and of leap seconds) at the receiver
+        double receptionTdbMinusTtChange =
+                sofa_interface::getTDBminusTT( static_cast< double >( receptionTdbEndTime ), receivingStationPosition ) -
+                sofa_interface::getTDBminusTT( static_cast< double >( receptionTdbStartTime ), receivingStationPosition );
+        double receptionLeapSecondChange = std::round(
+                static_cast< double >( ( receptionTdbEndTime - receptionTdbStartTime ) - integrationTime ) - receptionTdbMinusTtChange );
+        ObservationScalarType receptionIntervalLength = static_cast< ObservationScalarType >( integrationTime ) +
+                static_cast< ObservationScalarType >( receptionTdbMinusTtChange + receptionLeapSecondChange );
+
+        // Interval of each link end (transmitter, retransmitter, receiver)
+        std::vector< std::shared_ptr< LightTimeCalculator< ObservationScalarType, TimeType > > > startLegs =
+                arcStartObservationModel_->getLightTimeCalculators( );
+        std::vector< std::shared_ptr< LightTimeCalculator< ObservationScalarType, TimeType > > > endLegs =
+                arcEndObservationModel_->getLightTimeCalculators( );
+        std::vector< ObservationScalarType > intervalLengths = { 0.0, 0.0, receptionIntervalLength };
+        for( int leg = 1; leg >= 0; leg-- )
+        {
+            intervalLengths.at( leg ) = intervalLengths.at( leg + 1 ) -
+                    ( endLegs.at( leg )->getCurrentIdealLightTime( ) + endLegs.at( leg )->getCurrentLightTimeCorrection( ) -
+                      startLegs.at( leg )->getCurrentIdealLightTime( ) - startLegs.at( leg )->getCurrentLightTimeCorrection( ) );
+        }
+
+        // Displacement of each link end over its interval
+        std::vector< Eigen::Matrix< ObservationScalarType, 3, 1 > > displacements( 3 );
+        for( unsigned int i = 0; i < 3; i++ )
+        {
+            double startTime = arcStartLinkEndTimes.at( i == 0 ? 0 : 2 * i - 1 );
+            double endTime = startTime + static_cast< double >( intervalLengths.at( i ) );
+            int numberOfSubintervals = std::max( 1, static_cast< int >( std::ceil( std::fabs( endTime - startTime ) / 60.0 ) ) );
+            ObservationScalarType subintervalLength =
+                    intervalLengths.at( i ) / static_cast< ObservationScalarType >( numberOfSubintervals );
+            displacements.at( i ).setZero( );
+            for( int j = 0; j < numberOfSubintervals; j++ )
+            {
+                for( unsigned int k = 0; k < 5; k++ )
+                {
+                    double nodeTime = startTime + static_cast< double >( ( j + 0.5 + 0.5 * nodes[ k ] ) * subintervalLength );
+                    displacements.at( i ) += static_cast< ObservationScalarType >( 0.5 * weights[ k ] ) * subintervalLength *
+                            linkEndBodyStateFunctions_.at( i )( nodeTime ).segment( 3, 3 ).template cast< ObservationScalarType >( );
+                }
+            }
+
+            // Guard against an ephemeris whose velocity is inconsistent with its positions
+            Eigen::Vector3d positionChange = linkEndBodyStateFunctions_.at( i )( endTime ).segment( 0, 3 ) -
+                    linkEndBodyStateFunctions_.at( i )( startTime ).segment( 0, 3 );
+            if( ( displacements.at( i ).template cast< double >( ) - positionChange ).norm( ) > 1.0E-2 )
+            {
+                return TUDAT_NAN;
+            }
+
+            // Change of the position w.r.t. the body (small, so differenced directly; scaled for the rounding of endTime)
+            if( linkEndStationPositionFunctions_.at( i ) != nullptr && endTime != startTime )
+            {
+                displacements.at( i ) +=
+                        ( ( linkEndStationPositionFunctions_.at( i )( endTime ) - linkEndStationPositionFunctions_.at( i )( startTime ) ) *
+                          ( static_cast< double >( intervalLengths.at( i ) ) / ( endTime - startTime ) ) )
+                                .template cast< ObservationScalarType >( );
+            }
+        }
+
+        // Change of the total light time
+        ObservationScalarType lightTimeChange = 0.0;
+        for( unsigned int leg = 0; leg < 2; leg++ )
+        {
+            Eigen::Matrix< ObservationScalarType, 3, 1 > legVector =
+                    ( arcStartLinkEndStates.at( 2 * leg + 1 ).segment( 0, 3 ) - arcStartLinkEndStates.at( 2 * leg ).segment( 0, 3 ) )
+                            .template cast< ObservationScalarType >( );
+            Eigen::Matrix< ObservationScalarType, 3, 1 > legVectorChange = displacements.at( leg + 1 ) - displacements.at( leg );
+            lightTimeChange += ( 2.0 * legVector.dot( legVectorChange ) + legVectorChange.squaredNorm( ) ) /
+                            ( ( legVector + legVectorChange ).norm( ) + legVector.norm( ) ) /
+                            physical_constants::getSpeedOfLight< ObservationScalarType >( ) +
+                    ( endLegs.at( leg )->getCurrentLightTimeCorrection( ) - startLegs.at( leg )->getCurrentLightTimeCorrection( ) );
+        }
+
+        // Transmission interval in TDB, then in UTC at the transmitter
+        ObservationScalarType transmissionTdbIntervalLength = receptionIntervalLength - lightTimeChange;
+        double transmissionTdbMinusTtChange = sofa_interface::getTDBminusTT( static_cast< double >( transmissionTdbStartTime ) +
+                                                                                     static_cast< double >( transmissionTdbIntervalLength ),
+                                                                             transmittingStationPosition ) -
+                sofa_interface::getTDBminusTT( static_cast< double >( transmissionTdbStartTime ), transmittingStationPosition );
+        double transmissionLeapSecondChange = std::round( static_cast< double >( ( transmissionTdbEndTime - transmissionTdbStartTime ) -
+                                                                                 ( transmissionUtcEndTime - transmissionUtcStartTime ) ) -
+                                                          transmissionTdbMinusTtChange );
+        return transmissionTdbIntervalLength -
+                static_cast< ObservationScalarType >( transmissionTdbMinusTtChange + transmissionLeapSecondChange );
+    }
+
+    // Link-end motion (see setLinkEndMotionFunctions)
+    std::vector< std::function< Eigen::Vector6d( const double ) > > linkEndBodyStateFunctions_;
+    std::vector< std::function< Eigen::Vector3d( const double ) > > linkEndStationPositionFunctions_;
+
     // N-way range observation model associated with the start of the Doppler integration time.
     std::shared_ptr< NWayRangeObservationModel< ObservationScalarType, TimeType > > arcStartObservationModel_;
 

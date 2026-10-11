@@ -1277,17 +1277,57 @@ public:
                     }
                 }
 
-                observationModel = std::make_shared< DsnNWayAveragedDopplerObservationModel< ObservationScalarType, TimeType > >(
-                        linkEnds,
-                        arcStartObservationModel,
-                        arcEndObservationModel,
-                        bodies.getBody( linkEnds.at( observation_models::transmitter ).bodyName_ )
-                                ->getGroundStation( linkEnds.at( observation_models::transmitter ).getReferencePointName( ) )
-                                ->getTransmittingFrequencyCalculator( ),
-                        turnaroundRatioFunction,
-                        observationBias,
-                        stationStates,
-                        dsnNWayAveragedDopplerObservationSettings->getSubtractDopplerSignature( ) );
+                std::shared_ptr< DsnNWayAveragedDopplerObservationModel< ObservationScalarType, TimeType > > dsnNWayAveragedDopplerModel =
+                        std::make_shared< DsnNWayAveragedDopplerObservationModel< ObservationScalarType, TimeType > >(
+                                linkEnds,
+                                arcStartObservationModel,
+                                arcEndObservationModel,
+                                bodies.getBody( linkEnds.at( observation_models::transmitter ).bodyName_ )
+                                        ->getGroundStation( linkEnds.at( observation_models::transmitter ).getReferencePointName( ) )
+                                        ->getTransmittingFrequencyCalculator( ),
+                                turnaroundRatioFunction,
+                                observationBias,
+                                stationStates,
+                                dsnNWayAveragedDopplerObservationSettings->getSubtractDopplerSignature( ) );
+
+                // Link-end motion, so that the change of the light time over the count is computed without differencing two
+                // light times (only for body centers and ground stations; otherwise the light times are differenced)
+                std::vector< std::function< Eigen::Vector6d( const double ) > > bodyStateFunctions;
+                std::vector< std::function< Eigen::Vector3d( const double ) > > stationPositionFunctions;
+                for( unsigned int i = 0; i < linkEnds.size( ); i++ )
+                {
+                    LinkEndId linkEnd = linkEnds.at( getNWayLinkEnumFromIndex( i, linkEnds.size( ) ) );
+                    std::shared_ptr< simulation_setup::Body > body = bodies.at( linkEnd.bodyName_ );
+                    std::string referencePoint = linkEnd.getReferencePointName( );
+                    if( referencePoint != "" && !simulation_setup::isReferencePointGroundStation( body, referencePoint ) )
+                    {
+                        bodyStateFunctions.clear( );
+                        break;
+                    }
+                    bodyStateFunctions.push_back(
+                            [ = ]( const double time ) { return body->getStateInBaseFrameFromEphemeris< double, double >( time ); } );
+                    if( referencePoint == "" )
+                    {
+                        stationPositionFunctions.push_back( nullptr );
+                    }
+                    else
+                    {
+                        std::shared_ptr< ground_stations::GroundStation > station = body->getGroundStation( referencePoint );
+                        std::string frameOrigin = bodies.getFrameOrigin( );
+                        stationPositionFunctions.push_back( [ = ]( const double time ) {
+                            return Eigen::Vector3d( ephemerides::transformStateToInertialOrientation< double, double >(
+                                                            station->getStateInPlanetFixedFrame< double, double >( time, frameOrigin ),
+                                                            time,
+                                                            body->getRotationalEphemeris( ) )
+                                                            .segment( 0, 3 ) );
+                        } );
+                    }
+                }
+                if( bodyStateFunctions.size( ) == linkEnds.size( ) )
+                {
+                    dsnNWayAveragedDopplerModel->setLinkEndMotionFunctions( bodyStateFunctions, stationPositionFunctions );
+                }
+                observationModel = dsnNWayAveragedDopplerModel;
                 break;
             }
             case dsn_n_way_range: {
