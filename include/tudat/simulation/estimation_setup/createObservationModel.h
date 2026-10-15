@@ -2408,7 +2408,10 @@ public:
                 // Functions used to compute the change of the signal path over the count from the displacement of each link
                 // end (body velocity + change of the position w.r.t. the body), instead of differencing two light times
                 std::vector< std::function< Eigen::Vector6d( const double ) > > linkEndBodyStateFunctions;
-                std::vector< std::function< Eigen::Vector3d( const double ) > > linkEndReferencePointOffsetFunctions;
+                // The reference-point offsets are evaluated with Time epochs: with double epochs (~1E8 s) the Earth rotation
+                // angle is computed from days since J2000 in double (~4E-8 s resolution), i.e. micrometre jitter of a station's
+                // inertial position, ~1E-14 s per leg on the count interval length (~8E-3 mHz on a 60-s Ka count)
+                std::vector< std::function< Eigen::Vector3d( const Time& ) > > linkEndReferencePointOffsetFunctions;
                 for( unsigned int i = 0; i < linkEnds.size( ); i++ )
                 {
                     LinkEndId currentLinkEnd = linkEnds.at( getNWayLinkEnumFromIndex( i, linkEnds.size( ) ) );
@@ -2439,9 +2442,11 @@ public:
 
                     if( bodyFixedReferencePointStateFunction != nullptr )
                     {
-                        linkEndReferencePointOffsetFunctions.push_back( [ = ]( const double time ) {
-                            return Eigen::Vector3d( ephemerides::transformStateToInertialOrientation< double, double >(
-                                                            bodyFixedReferencePointStateFunction( time ), time, linkEndBody->getRotationalEphemeris( ) )
+                        linkEndReferencePointOffsetFunctions.push_back( [ = ]( const Time& time ) {
+                            return Eigen::Vector3d( ephemerides::transformStateToInertialOrientation< double, Time >(
+                                                            bodyFixedReferencePointStateFunction( static_cast< double >( time ) ),
+                                                            time,
+                                                            linkEndBody->getRotationalEphemeris( ) )
                                                             .segment( 0, 3 ) );
                         } );
                     }
